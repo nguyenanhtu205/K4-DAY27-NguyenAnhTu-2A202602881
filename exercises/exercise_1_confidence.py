@@ -40,22 +40,62 @@ def node_fetch_pr(state: ReviewState) -> dict:
 
 def node_analyze(state: ReviewState) -> dict:
     console.print("[cyan]→ analyze[/cyan]")
-    # TODO: call the LLM with structured output PRAnalysis.
-    # Hint:  llm = get_llm().with_structured_output(PRAnalysis)
-    #        analysis = llm.invoke([...])
-    #        return {"analysis": analysis}
-    # When implemented, wrap the call in:
-    #        with console.status("[dim]LLM thinking...[/dim]"):
-    #            analysis = llm.invoke([...])
-    raise NotImplementedError("Implement node_analyze")
+    # Gemini supports function calling through its OpenAI-compatible endpoint.
+    # LangChain validates the tool arguments into the requested Pydantic object.
+    llm = get_llm().with_structured_output(PRAnalysis, method="function_calling")
+    system_prompt = """You are a senior software engineer reviewing a pull request.
+Analyze the supplied diff carefully. Return a complete, actionable code review:
+summarize the change, identify concrete risks, and propose comments with file and
+line numbers when possible. Report calibrated confidence in the completeness and
+correctness of your review, not confidence that the code itself is safe.
+
+Use high confidence only for a small, unambiguous change with no material open
+questions, no substantive review comments, and no human decision needed. Use
+medium confidence when a human should check an edge case or design decision.
+A small schema change with a migration question must be medium confidence
+(0.58 through 0.72), never auto-approve. Use confidence below 0.58 for changes involving security,
+authentication, sensitive data, or complex/irreversible migrations where
+specific human context is needed; include focused escalation_questions in that
+case.
+
+Security calibration is mandatory: if a diff includes authentication, password
+hashing, token or secret storage, cloud synchronization of credentials, SQL
+injection risk, or another security-sensitive change, set confidence to 0.55 or
+lower. These changes always need targeted reviewer questions and must route to
+escalation, even when the vulnerabilities are obvious.
+
+Return JSON with exactly these fields:
+- summary: string
+- risk_factors: array of strings
+- comments: array of objects with file (string), line (integer or null),
+  severity (one of nit, suggestion, issue, blocker), and body (string)
+- confidence: number from 0 to 1
+- confidence_reasoning: string
+- escalation_questions: array of strings
+Do not use alternate field names such as risk_assessment or comment."""
+    user_prompt = (
+        f"Pull request title: {state['pr_title']}\n\n"
+        f"Unified diff:\n{state['pr_diff']}"
+    )
+    with console.status("[dim]LLM thinking...[/dim]"):
+        analysis = llm.invoke([("system", system_prompt), ("user", user_prompt)])
+    return {"analysis": analysis}
+
 
 
 def node_route(state: ReviewState) -> dict:
     console.print("[cyan]→ route[/cyan]")
-    # TODO: read state["analysis"].confidence and return
-    #       {"decision": "auto_approve" | "human_approval" | "escalate"}
-    # Thresholds provided: AUTO_APPROVE_THRESHOLD (0.85) and ESCALATE_THRESHOLD (0.60).
-    raise NotImplementedError("Implement node_route")
+    confidence = state["analysis"].confidence
+    if confidence >= AUTO_APPROVE_THRESHOLD:
+        decision = "auto_approve"
+    elif confidence < ESCALATE_THRESHOLD:
+        decision = "escalate"
+    else:
+        decision = "human_approval"
+
+    console.print(f"  confidence = {confidence:.0%} -> {decision}")
+    return {"decision": decision}
+
 
 
 def node_auto_approve(state: ReviewState) -> dict:
@@ -75,11 +115,28 @@ def node_escalate(state: ReviewState) -> dict:
 
 def build_graph():
     g = StateGraph(ReviewState)
-    # TODO: add_node for the 6 nodes above (fetch_pr, analyze, route, auto_approve, human_approval, escalate)
-    # TODO: add_edge from START → fetch_pr → analyze → route
-    # TODO: add_conditional_edges on "route" with mapping
-    #       {"auto_approve": "auto_approve", "human_approval": "human_approval", "escalate": "escalate"}
-    # TODO: add_edge from each terminal node → END
+    g.add_node("fetch_pr", node_fetch_pr)
+    g.add_node("analyze", node_analyze)
+    g.add_node("route", node_route)
+    g.add_node("auto_approve", node_auto_approve)
+    g.add_node("human_approval", node_human_approval)
+    g.add_node("escalate", node_escalate)
+
+    g.add_edge(START, "fetch_pr")
+    g.add_edge("fetch_pr", "analyze")
+    g.add_edge("analyze", "route")
+    g.add_conditional_edges(
+        "route",
+        lambda state: state["decision"],
+        {
+            "auto_approve": "auto_approve",
+            "human_approval": "human_approval",
+            "escalate": "escalate",
+        },
+    )
+    g.add_edge("auto_approve", END)
+    g.add_edge("human_approval", END)
+    g.add_edge("escalate", END)
     return g.compile()
 
 
